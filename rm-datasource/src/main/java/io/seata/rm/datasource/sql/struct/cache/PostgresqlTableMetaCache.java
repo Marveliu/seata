@@ -19,13 +19,15 @@ import java.sql.Connection;
 import java.sql.DatabaseMetaData;
 import java.sql.ResultSet;
 import java.sql.SQLException;
+
+import io.seata.common.exception.NotSupportYetException;
 import io.seata.common.exception.ShouldNeverHappenException;
 import io.seata.common.loader.LoadLevel;
 import io.seata.common.util.StringUtils;
-import io.seata.rm.datasource.sql.struct.ColumnMeta;
-import io.seata.rm.datasource.sql.struct.IndexMeta;
-import io.seata.rm.datasource.sql.struct.IndexType;
-import io.seata.rm.datasource.sql.struct.TableMeta;
+import io.seata.sqlparser.struct.ColumnMeta;
+import io.seata.sqlparser.struct.IndexMeta;
+import io.seata.sqlparser.struct.IndexType;
+import io.seata.sqlparser.struct.TableMeta;
 import io.seata.sqlparser.util.JdbcConstants;
 
 /**
@@ -59,8 +61,7 @@ public class PostgresqlTableMetaCache extends AbstractTableMetaCache {
     @Override
     protected TableMeta fetchSchema(Connection connection, String tableName) throws SQLException {
         try {
-            DatabaseMetaData dbmd = connection.getMetaData();
-            return resultSetMetaToSchema(dbmd, tableName);
+            return resultSetMetaToSchema(connection, tableName);
         } catch (SQLException sqlEx) {
             throw sqlEx;
         } catch (Exception e) {
@@ -68,7 +69,8 @@ public class PostgresqlTableMetaCache extends AbstractTableMetaCache {
         }
     }
 
-    private TableMeta resultSetMetaToSchema(DatabaseMetaData dbmd, String tableName) throws SQLException {
+    private TableMeta resultSetMetaToSchema(Connection connection, String tableName) throws SQLException {
+        DatabaseMetaData dbmd = connection.getMetaData();
         TableMeta tm = new TableMeta();
         tm.setTableName(tableName);
         String[] schemaTable = tableName.split("\\.");
@@ -97,12 +99,16 @@ public class PostgresqlTableMetaCache extends AbstractTableMetaCache {
             } else {
                 schemaName = schemaName.toLowerCase();
             }
+        } else {
+            schemaName = connection.getSchema();
         }
+
         if (tableName.startsWith("\"") && tableName.endsWith("\"")) {
             tableName = tableName.replaceAll("(^\")|(\"$)", "");
         } else {
             tableName = tableName.toLowerCase();
         }
+        tm.setCaseSensitive(StringUtils.hasUpperCase(tableName));
 
         try (ResultSet rsColumns = dbmd.getColumns(null, schemaName, tableName, "%");
              ResultSet rsIndex = dbmd.getIndexInfo(null, schemaName, tableName, false, true);
@@ -127,6 +133,11 @@ public class PostgresqlTableMetaCache extends AbstractTableMetaCache {
                 col.setOrdinalPosition(rsColumns.getInt("ORDINAL_POSITION"));
                 col.setIsNullAble(rsColumns.getString("IS_NULLABLE"));
                 col.setIsAutoincrement(rsColumns.getString("IS_AUTOINCREMENT"));
+                col.setCaseSensitive(StringUtils.hasUpperCase(col.getColumnName()));
+
+                if (tm.getAllColumns().containsKey(col.getColumnName())) {
+                    throw new NotSupportYetException("Not support the table has the same column name with different case yet");
+                }
                 tm.getAllColumns().put(col.getColumnName(), col);
             }
 
@@ -149,7 +160,7 @@ public class PostgresqlTableMetaCache extends AbstractTableMetaCache {
                     index.setType(rsIndex.getShort("type"));
                     index.setOrdinalPosition(rsIndex.getShort("ordinal_position"));
                     index.setAscOrDesc(rsIndex.getString("asc_or_desc"));
-                    index.setCardinality(rsIndex.getInt("cardinality"));
+                    index.setCardinality(rsIndex.getLong("cardinality"));
                     index.getValues().add(col);
                     if (!index.isNonUnique()) {
                         index.setIndextype(IndexType.UNIQUE);

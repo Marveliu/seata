@@ -22,13 +22,14 @@ import java.sql.ResultSetMetaData;
 import java.sql.SQLException;
 import java.sql.Statement;
 
+import io.seata.common.exception.NotSupportYetException;
 import io.seata.common.exception.ShouldNeverHappenException;
 import io.seata.common.loader.LoadLevel;
-import io.seata.rm.datasource.ColumnUtils;
-import io.seata.rm.datasource.sql.struct.ColumnMeta;
-import io.seata.rm.datasource.sql.struct.IndexMeta;
-import io.seata.rm.datasource.sql.struct.IndexType;
-import io.seata.rm.datasource.sql.struct.TableMeta;
+import io.seata.sqlparser.util.ColumnUtils;
+import io.seata.sqlparser.struct.ColumnMeta;
+import io.seata.sqlparser.struct.IndexMeta;
+import io.seata.sqlparser.struct.IndexType;
+import io.seata.sqlparser.struct.TableMeta;
 import io.seata.sqlparser.util.JdbcConstants;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -41,7 +42,7 @@ import org.slf4j.LoggerFactory;
 @LoadLevel(name = JdbcConstants.MYSQL)
 public class MysqlTableMetaCache extends AbstractTableMetaCache {
 
-    private static final Logger LOGGER = LoggerFactory.getLogger(MysqlTableMetaCache.class);
+    protected final Logger logger = LoggerFactory.getLogger(getClass());
 
     @Override
     protected String getCacheKey(Connection connection, String tableName, String resourceId) {
@@ -55,7 +56,7 @@ public class MysqlTableMetaCache extends AbstractTableMetaCache {
         try {
             databaseMetaData = connection.getMetaData();
         } catch (SQLException e) {
-            LOGGER.error("Could not get connection, use default cache key {}", e.getMessage(), e);
+            logger.error("Could not get connection, use default cache key {}", e.getMessage(), e);
             return cacheKey.append(defaultTableName).toString();
         }
 
@@ -67,7 +68,7 @@ public class MysqlTableMetaCache extends AbstractTableMetaCache {
                 cacheKey.append(defaultTableName.toLowerCase());
             }
         } catch (SQLException e) {
-            LOGGER.error("Could not get supportsMixedCaseIdentifiers in connection metadata, use default cache key {}", e.getMessage(), e);
+            logger.error("Could not get supportsMixedCaseIdentifiers in connection metadata, use default cache key {}", e.getMessage(), e);
             return cacheKey.append(defaultTableName).toString();
         }
 
@@ -87,7 +88,7 @@ public class MysqlTableMetaCache extends AbstractTableMetaCache {
         }
     }
 
-    private TableMeta resultSetMetaToSchema(ResultSetMetaData rsmd, DatabaseMetaData dbmd)
+    protected TableMeta resultSetMetaToSchema(ResultSetMetaData rsmd, DatabaseMetaData dbmd)
         throws SQLException {
         //always "" for mysql
         String schemaName = rsmd.getSchemaName(1);
@@ -105,6 +106,9 @@ public class MysqlTableMetaCache extends AbstractTableMetaCache {
 
         TableMeta tm = new TableMeta();
         tm.setTableName(tableName);
+        //always true and nothing to do with escape characters for mysql.
+        // May be not consistent with lower_case_table_names
+        tm.setCaseSensitive(true);
 
         /*
          * here has two different type to get the data
@@ -114,7 +118,8 @@ public class MysqlTableMetaCache extends AbstractTableMetaCache {
          */
 
         try (ResultSet rsColumns = dbmd.getColumns(catalogName, schemaName, tableName, "%");
-             ResultSet rsIndex = dbmd.getIndexInfo(catalogName, schemaName, tableName, false, true)) {
+             ResultSet rsIndex = dbmd.getIndexInfo(catalogName, schemaName, tableName, false, true);
+             ResultSet onUpdateColumns = dbmd.getVersionColumns(catalogName, schemaName, tableName)) {
             while (rsColumns.next()) {
                 ColumnMeta col = new ColumnMeta();
                 col.setTableCat(rsColumns.getString("TABLE_CAT"));
@@ -135,8 +140,16 @@ public class MysqlTableMetaCache extends AbstractTableMetaCache {
                 col.setOrdinalPosition(rsColumns.getInt("ORDINAL_POSITION"));
                 col.setIsNullAble(rsColumns.getString("IS_NULLABLE"));
                 col.setIsAutoincrement(rsColumns.getString("IS_AUTOINCREMENT"));
+                col.setCaseSensitive(rsmd.isCaseSensitive(col.getOrdinalPosition()));
 
+                if (tm.getAllColumns().containsKey(col.getColumnName())) {
+                    throw new NotSupportYetException("Not support the table has the same column name with different case yet");
+                }
                 tm.getAllColumns().put(col.getColumnName(), col);
+            }
+
+            while (onUpdateColumns.next()) {
+                tm.getAllColumns().get(onUpdateColumns.getString("COLUMN_NAME")).setOnUpdate(true);
             }
 
             while (rsIndex.next()) {
@@ -156,7 +169,7 @@ public class MysqlTableMetaCache extends AbstractTableMetaCache {
                     index.setType(rsIndex.getShort("TYPE"));
                     index.setOrdinalPosition(rsIndex.getShort("ORDINAL_POSITION"));
                     index.setAscOrDesc(rsIndex.getString("ASC_OR_DESC"));
-                    index.setCardinality(rsIndex.getInt("CARDINALITY"));
+                    index.setCardinality(rsIndex.getLong("CARDINALITY"));
                     index.getValues().add(col);
                     if ("PRIMARY".equalsIgnoreCase(indexName)) {
                         index.setIndextype(IndexType.PRIMARY);

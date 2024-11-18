@@ -15,22 +15,6 @@
  */
 package io.seata.discovery.registry.consul;
 
-import com.ecwid.consul.v1.ConsulClient;
-import com.ecwid.consul.v1.QueryParams;
-import com.ecwid.consul.v1.Response;
-import com.ecwid.consul.v1.agent.model.NewService;
-import com.ecwid.consul.v1.health.HealthServicesRequest;
-import com.ecwid.consul.v1.health.model.HealthService;
-import io.seata.common.thread.NamedThreadFactory;
-import io.seata.common.util.NetUtil;
-import io.seata.config.Configuration;
-import io.seata.config.ConfigurationFactory;
-import io.seata.config.ConfigurationKeys;
-import io.seata.discovery.registry.RegistryService;
-import org.apache.commons.lang.StringUtils;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
 import java.net.InetSocketAddress;
 import java.util.Collections;
 import java.util.HashSet;
@@ -43,6 +27,26 @@ import java.util.concurrent.LinkedBlockingQueue;
 import java.util.concurrent.ThreadPoolExecutor;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.Collectors;
+
+import io.seata.config.exception.ConfigNotFoundException;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
+
+import com.ecwid.consul.v1.ConsulClient;
+import com.ecwid.consul.v1.QueryParams;
+import com.ecwid.consul.v1.Response;
+import com.ecwid.consul.v1.agent.model.NewService;
+import com.ecwid.consul.v1.health.HealthServicesRequest;
+import com.ecwid.consul.v1.health.model.HealthService;
+
+import io.seata.common.thread.NamedThreadFactory;
+import io.seata.common.util.NetUtil;
+import io.seata.common.util.StringUtils;
+import io.seata.config.Configuration;
+import io.seata.config.ConfigurationFactory;
+import io.seata.config.ConfigurationKeys;
+import io.seata.discovery.registry.RegistryHeartBeats;
+import io.seata.discovery.registry.RegistryService;
 
 /**
  * @author xingfudeshi@gmail.com
@@ -119,6 +123,12 @@ public class ConsulRegistryServiceImpl implements RegistryService<ConsulListener
     @Override
     public void register(InetSocketAddress address) throws Exception {
         NetUtil.validAddress(address);
+        doRegister(address);
+        RegistryHeartBeats.addHeartBeat(REGISTRY_TYPE, address, this::doRegister);
+
+    }
+
+    private void doRegister(InetSocketAddress address) {
         getConsulClient().agentServiceRegister(createService(address), getAclToken());
     }
 
@@ -154,8 +164,14 @@ public class ConsulRegistryServiceImpl implements RegistryService<ConsulListener
     public List<InetSocketAddress> lookup(String key) throws Exception {
         final String cluster = getServiceGroup(key);
         if (cluster == null) {
-            return null;
+            String missingDataId = PREFIX_SERVICE_ROOT + CONFIG_SPLIT_CHAR + PREFIX_SERVICE_MAPPING + key;
+            throw new ConfigNotFoundException("%s configuration item is required", missingDataId);
         }
+        return lookupByCluster(cluster);
+
+    }
+
+    private List<InetSocketAddress> lookupByCluster(String cluster) throws Exception {
         if (!listenerMap.containsKey(cluster)) {
             //1.refresh cluster
             refreshCluster(cluster);
@@ -184,7 +200,7 @@ public class ConsulRegistryServiceImpl implements RegistryService<ConsulListener
     }
 
     /**
-     * get cluster name
+     * get cluster name , this function is only on the server use
      *
      * @return
      */
@@ -268,10 +284,10 @@ public class ConsulRegistryServiceImpl implements RegistryService<ConsulListener
      * @param cluster
      */
     private void refreshCluster(String cluster) {
-        if (cluster == null) {
+        if (StringUtils.isBlank(cluster)) {
             return;
         }
-        Response<List<HealthService>> response = getHealthyServices(getClusterName(), -1, -1);
+        Response<List<HealthService>> response = getHealthyServices(cluster, -1, -1);
         if (response == null) {
             return;
         }
@@ -298,6 +314,7 @@ public class ConsulRegistryServiceImpl implements RegistryService<ConsulListener
      * consul notifier
      */
     private class ConsulNotifier implements Runnable {
+
         private String cluster;
         private long consulIndex;
         private boolean running;
@@ -328,7 +345,7 @@ public class ConsulRegistryServiceImpl implements RegistryService<ConsulListener
             if ((currentIndex != null && currentIndex > consulIndex) || hasError) {
                 hasError = false;
                 List<HealthService> services = response.getValue();
-                consulIndex = currentIndex;
+                consulIndex = currentIndex;/*lgtm[java/dereferenced-value-may-be-null]*/
                 for (ConsulListener listener : listenerMap.get(cluster)) {
                     listener.onEvent(services);
                 }

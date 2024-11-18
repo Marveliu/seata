@@ -21,6 +21,7 @@ import java.util.List;
 import java.util.Map;
 
 import io.seata.rm.datasource.sql.struct.Field;
+import io.seata.sqlparser.util.ColumnUtils;
 
 /**
  * generate sql and set value to sql
@@ -95,10 +96,10 @@ public class SqlGenerateUtils {
     /**
      * set parameter for PreparedStatement, this is only used in pk sql.
      *
-     * @param pkRowsList
-     * @param pkColumnNameList
-     * @param pst
-     * @throws SQLException
+     * @param pkRowsList pkRowsList
+     * @param pkColumnNameList pkColumnNameList
+     * @param pst preparedStatement
+     * @throws SQLException SQLException
      */
     public static void setParamForPk(List<Map<String, Field>> pkRowsList, List<String> pkColumnNameList,
                                      PreparedStatement pst) throws SQLException {
@@ -116,7 +117,8 @@ public class SqlGenerateUtils {
     /**
      * each pk is a condition.the result will like :" id =? and userCode =?"
      *
-     * @param pkNameList
+     * @param pkNameList pkNameList
+     * @param dbType dbType
      * @return return where condition sql string.the sql can just search one related record.
      */
     public static String buildWhereConditionByPKs(List<String> pkNameList, String dbType) {

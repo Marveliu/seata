@@ -28,7 +28,7 @@ import java.io.ByteArrayOutputStream;
 import java.io.IOException;
 
 /**
- * @Xin Wang
+ * @author XinWang
  */
 @LoadLevel(name = "HESSIAN")
 public class HessianSerializer implements Serializer {
@@ -54,7 +54,7 @@ public class HessianSerializer implements Serializer {
     @Override
     public <T> T deserialize(byte[] bytes) {
         T obj = null;
-        try (ByteArrayInputStream is = new ByteArrayInputStream(bytes);) {
+        try (ByteArrayInputStream is = new ByteArrayInputStream(bytes)) {
             Hessian2Input input = new Hessian2Input(is);
             obj = (T) input.readObject();
             input.close();

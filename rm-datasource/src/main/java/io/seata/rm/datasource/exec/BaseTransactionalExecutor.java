@@ -22,26 +22,34 @@ import java.sql.Statement;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
-import java.util.Objects;
+import java.util.StringJoiner;
+import java.util.stream.Collectors;
 
+import io.seata.common.DefaultValues;
 import io.seata.common.exception.ShouldNeverHappenException;
 import io.seata.common.util.CollectionUtils;
 import io.seata.common.util.IOUtil;
 import io.seata.common.util.StringUtils;
+import io.seata.config.ConfigurationFactory;
+import io.seata.core.constants.ConfigurationKeys;
 import io.seata.core.context.RootContext;
-import io.seata.rm.datasource.ColumnUtils;
+import io.seata.sqlparser.util.ColumnUtils;
 import io.seata.rm.datasource.ConnectionProxy;
 import io.seata.rm.datasource.SqlGenerateUtils;
 import io.seata.rm.datasource.StatementProxy;
 import io.seata.rm.datasource.sql.struct.Field;
-import io.seata.rm.datasource.sql.struct.TableMeta;
+import io.seata.sqlparser.struct.TableMeta;
 import io.seata.rm.datasource.sql.struct.TableMetaCacheFactory;
 import io.seata.rm.datasource.sql.struct.TableRecords;
 import io.seata.rm.datasource.undo.SQLUndoLog;
 import io.seata.sqlparser.ParametersHolder;
+import io.seata.sqlparser.SQLInsertRecognizer;
 import io.seata.sqlparser.SQLRecognizer;
 import io.seata.sqlparser.SQLType;
 import io.seata.sqlparser.WhereRecognizer;
+
+
+import static io.seata.rm.datasource.exec.AbstractDMLBaseExecutor.WHERE;
 
 /**
  * The type Base transactional executor.
@@ -51,6 +59,9 @@ import io.seata.sqlparser.WhereRecognizer;
  * @author sharajava
  */
 public abstract class BaseTransactionalExecutor<T, S extends Statement> implements Executor<T> {
+
+    private static final boolean ONLY_CARE_UPDATE_COLUMNS = ConfigurationFactory.getInstance().getBoolean(
+            ConfigurationKeys.TRANSACTION_UNDO_ONLY_CARE_UPDATE_COLUMNS, DefaultValues.DEFAULT_ONLY_CARE_UPDATE_COLUMNS);
 
     /**
      * The Statement proxy.
@@ -150,6 +161,38 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
     }
 
     /**
+     * build buildOrderCondition
+     * @param recognizer
+     * @param paramAppenderList
+     * @return the string
+     */
+    protected String buildOrderCondition(WhereRecognizer recognizer, ArrayList<List<Object>> paramAppenderList) {
+        String orderByCondition = null;
+        if (statementProxy instanceof ParametersHolder) {
+            orderByCondition = recognizer.getOrderByCondition((ParametersHolder) statementProxy, paramAppenderList);
+        } else {
+            orderByCondition = recognizer.getOrderByCondition();
+        }
+        return orderByCondition;
+    }
+
+    /**
+     * build buildLimitCondition
+     * @param recognizer
+     * @param paramAppenderList
+     * @return the string
+     */
+    protected String buildLimitCondition(WhereRecognizer recognizer, ArrayList<List<Object>> paramAppenderList) {
+        String limitCondition = null;
+        if (statementProxy instanceof ParametersHolder) {
+            limitCondition = recognizer.getLimitCondition((ParametersHolder) statementProxy, paramAppenderList);
+        } else {
+            limitCondition = recognizer.getLimitCondition();
+        }
+        return limitCondition;
+    }
+
+    /**
      * Gets column name in sql.
      *
      * @param columnName the column name
@@ -160,6 +203,35 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
         return tableAlias == null ? columnName : tableAlias + "." + columnName;
     }
 
+
+    /**
+     * Gets column name with table prefix
+     *
+     * @param table      the table name
+     * @param tableAlias the tableAlias
+     * @param columnName the column name
+     * @return
+     */
+    protected String getColumnNameWithTablePrefix(String table, String tableAlias, String columnName) {
+        return tableAlias == null ? (table == null ? columnName : table + "." + columnName) : (tableAlias + "." + columnName);
+    }
+
+    /**
+     * Gets column name with table prefix
+     *
+     * @param table      the table name
+     * @param tableAlias the tableAlias
+     * @param columnNames the column names
+     * @return
+     */
+    protected List<String> getColumnNamesWithTablePrefixList(String table,String tableAlias,List<String> columnNames) {
+        List<String> columnNameWithTablePrefix = new ArrayList<>();
+        for (String columnName : columnNames) {
+            columnNameWithTablePrefix.add(this.getColumnNameWithTablePrefix(table,tableAlias,columnName));
+        }
+        return columnNameWithTablePrefix;
+    }
+
     /**
      * Gets several column name in sql.
      *
@@ -167,7 +239,7 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
      * @return the column name in sql
      */
     protected String getColumnNamesInSQL(List<String> columnNameList) {
-        if (Objects.isNull(columnNameList) || columnNameList.isEmpty()) {
+        if (CollectionUtils.isEmpty(columnNameList)) {
             return null;
         }
         StringBuilder columnNamesStr = new StringBuilder();
@@ -176,6 +248,28 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
                 columnNamesStr.append(" , ");
             }
             columnNamesStr.append(getColumnNameInSQL(columnNameList.get(i)));
+        }
+        return columnNamesStr.toString();
+    }
+
+    /**
+     * Gets several column name in sql.
+     *
+     * @param table          the table
+     * @param tableAlias     the table alias
+     * @param columnNameList the column name
+     * @return the column name in sql
+     */
+    protected String getColumnNamesWithTablePrefix(String table,String tableAlias, List<String> columnNameList) {
+        if (CollectionUtils.isEmpty(columnNameList)) {
+            return null;
+        }
+        StringBuilder columnNamesStr = new StringBuilder();
+        for (int i = 0; i < columnNameList.size(); i++) {
+            if (i > 0) {
+                columnNamesStr.append(" , ");
+            }
+            columnNamesStr.append(getColumnNameWithTablePrefix(table,tableAlias, columnNameList.get(i)));
         }
         return columnNamesStr.toString();
     }
@@ -223,11 +317,26 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
      * @return true: contains pk false: not contains pk
      */
     protected boolean containsPK(List<String> columns) {
-        if (columns == null || columns.isEmpty()) {
+        if (CollectionUtils.isEmpty(columns)) {
             return false;
         }
         List<String> newColumns = ColumnUtils.delEscape(columns, getDbType());
         return getTableMeta().containsPK(newColumns);
+    }
+
+    /**
+     * the columns contains table meta pk
+     *
+     * @param tableName the tableName
+     * @param columns the column name list
+     * @return true: contains pk false: not contains pk
+     */
+    protected boolean containsPK(String tableName,List<String> columns) {
+        if (CollectionUtils.isEmpty(columns)) {
+            return false;
+        }
+        List<String> newColumns = ColumnUtils.delEscape(columns, getDbType());
+        return getTableMeta(tableName).containsPK(newColumns);
     }
 
 
@@ -242,16 +351,16 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
         return CollectionUtils.toUpperList(getTableMeta().getPrimaryKeyOnlyName()).contains(newColumnName.toUpperCase());
     }
 
-
     /**
      * get standard pk column name from user sql column name
      *
-     * @return
+     * @param userColumnName the user column name
+     * @return standard pk column name
      */
     protected String getStandardPkColumnName(String userColumnName) {
         String newUserColumnName = ColumnUtils.delEscape(userColumnName, getDbType());
         for (String cn : getTableMeta().getPrimaryKeyOnlyName()) {
-            if (cn.toUpperCase().equals(newUserColumnName.toUpperCase())) {
+            if (cn.equalsIgnoreCase(newUserColumnName)) {
                 return cn;
             }
         }
@@ -300,19 +409,20 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
         StringBuilder sb = new StringBuilder();
         sb.append(rowsIncludingPK.getTableMeta().getTableName());
         sb.append(":");
-        int filedSequence = 0;
+        int rowSequence = 0;
         List<Map<String, Field>> pksRows = rowsIncludingPK.pkRows();
+        List<String> primaryKeysOnlyName = rowsIncludingPK.getTableMeta().getPrimaryKeyOnlyName();
         for (Map<String, Field> rowMap : pksRows) {
             int pkSplitIndex = 0;
-            for (String pkName : getTableMeta().getPrimaryKeyOnlyName()) {
+            for (String pkName : primaryKeysOnlyName) {
                 if (pkSplitIndex > 0) {
                     sb.append("_");
                 }
                 sb.append(rowMap.get(pkName).getValue());
                 pkSplitIndex++;
             }
-            filedSequence++;
-            if (filedSequence < pksRows.size()) {
+            rowSequence++;
+            if (rowSequence < pksRows.size()) {
                 sb.append(",");
             }
         }
@@ -337,7 +447,6 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
         sqlUndoLog.setAfterImage(afterImage);
         return sqlUndoLog;
     }
-
 
     /**
      * build a BeforeImage
@@ -371,23 +480,24 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
      *
      * @param pkValuesMap the pkValuesMap
      * @return return TableRecords;
-     * @throws SQLException
+     * @throws SQLException the sql exception
      */
     protected TableRecords buildTableRecords(Map<String, List<Object>> pkValuesMap) throws SQLException {
+        SQLInsertRecognizer recognizer = (SQLInsertRecognizer)sqlRecognizer;
         List<String> pkColumnNameList = getTableMeta().getPrimaryKeyOnlyName();
-        StringBuilder sql = new StringBuilder()
-            .append("SELECT * FROM ")
-            .append(getFromTableInSQL())
-            .append(" WHERE ");
+        String prefix = "SELECT ";
+        StringBuilder suffix = new StringBuilder(" FROM ").append(getFromTableInSQL());
         // build check sql
         String firstKey = pkValuesMap.keySet().stream().findFirst().get();
         int rowSize = pkValuesMap.get(firstKey).size();
-        sql.append(SqlGenerateUtils.buildWhereConditionByPKs(pkColumnNameList, rowSize, getDbType()));
-
-        PreparedStatement ps = null;
+        suffix.append(WHERE).append(SqlGenerateUtils.buildWhereConditionByPKs(pkColumnNameList, rowSize, getDbType()));
+        StringJoiner selectSQLJoin = new StringJoiner(", ", prefix, suffix.toString());
+        List<String> insertColumnsUnEscape = recognizer.getInsertColumnsUnEscape();
+        List<String> needColumns =
+            getNeedColumns(tableMeta.getTableName(), sqlRecognizer.getTableAlias(), insertColumnsUnEscape);
+        needColumns.forEach(selectSQLJoin::add);
         ResultSet rs = null;
-        try {
-            ps = statementProxy.getConnection().prepareStatement(sql.toString());
+        try (PreparedStatement ps = statementProxy.getConnection().prepareStatement(selectSQLJoin.toString())) {
 
             int paramIndex = 1;
             for (int r = 0; r < rowSize; r++) {
@@ -405,10 +515,41 @@ public abstract class BaseTransactionalExecutor<T, S extends Statement> implemen
         }
     }
 
+    protected List<String> getNeedColumns(String table, String tableAlias, List<String> unescapeColumns) {
+        List<String> needUpdateColumns = new ArrayList<>();
+        TableMeta tableMeta = getTableMeta(table);
+        if (ONLY_CARE_UPDATE_COLUMNS && CollectionUtils.isNotEmpty(unescapeColumns)) {
+            if (!containsPK(table, unescapeColumns)) {
+                List<String> pkNameList = tableMeta.getEscapePkNameList(getDbType());
+                if (CollectionUtils.isNotEmpty(pkNameList)) {
+                    if (StringUtils.isNotBlank(tableAlias)) {
+                        needUpdateColumns.add(getColumnNamesWithTablePrefix(table, tableAlias, pkNameList));
+                    } else {
+                        needUpdateColumns.add(getColumnNamesInSQL(pkNameList));
+                    }
+                }
+            }
+            needUpdateColumns.addAll(unescapeColumns.stream()
+                .map(unescapeUpdateColumn -> ColumnUtils.addEscape(unescapeUpdateColumn, getDbType(), tableMeta)).collect(
+                    Collectors.toList()));
+
+            // The on update xxx columns will be auto update by db, so it's also the actually updated columns
+            List<String> onUpdateColumns = tableMeta.getOnUpdateColumnsOnlyName();
+            onUpdateColumns.removeAll(unescapeColumns);
+            needUpdateColumns.addAll(onUpdateColumns.stream()
+                .map(onUpdateColumn -> ColumnUtils.addEscape(onUpdateColumn, getDbType(), tableMeta))
+                .collect(Collectors.toList()));
+        } else {
+            needUpdateColumns.addAll(tableMeta.getAllColumns().keySet().stream()
+                .map(columnName -> ColumnUtils.addEscape(columnName, getDbType(), tableMeta)).collect(Collectors.toList()));
+        }
+        return needUpdateColumns;
+    }
+
     /**
      * get db type
      *
-     * @return
+     * @return db type
      */
     protected String getDbType() {
         return statementProxy.getConnectionProxy().getDbType();

@@ -19,7 +19,9 @@ import java.util.List;
 
 import io.seata.common.exception.ShouldNeverHappenException;
 import io.seata.core.context.GlobalLockConfigHolder;
+import io.seata.core.exception.TmTransactionException;
 import io.seata.core.exception.TransactionException;
+import io.seata.core.exception.TransactionExceptionCode;
 import io.seata.core.model.GlobalLockConfig;
 import io.seata.core.model.GlobalStatus;
 import io.seata.tm.api.transaction.Propagation;
@@ -64,16 +66,16 @@ public class TransactionalTemplate {
                 case NOT_SUPPORTED:
                     // If transaction is existing, suspend it.
                     if (existingTransaction(tx)) {
-                        suspendedResourcesHolder = tx.suspend();
+                        suspendedResourcesHolder = tx.suspend(false);
                     }
                     // Execute without transaction and return.
                     return business.execute();
                 case REQUIRES_NEW:
                     // If transaction is existing, suspend it, and then begin new transaction.
                     if (existingTransaction(tx)) {
-                        suspendedResourcesHolder = tx.suspend();
-                        tx = GlobalTransactionContext.createNew();
+                        suspendedResourcesHolder = tx.suspend(false);
                     }
+                    tx = GlobalTransactionContext.createNew();
                     // Continue and execute with new transaction
                     break;
                 case SUPPORTS:
@@ -84,15 +86,15 @@ public class TransactionalTemplate {
                     // Continue and execute with new transaction
                     break;
                 case REQUIRED:
-                    // If current transaction is existing, execute with current transaction,
-                    // else continue and execute with new transaction.
+                    // If current transaction is existing, execute with current transaction,else create
+                    tx = GlobalTransactionContext.getCurrentOrCreate();
                     break;
                 case NEVER:
                     // If transaction is existing, throw exception.
                     if (existingTransaction(tx)) {
                         throw new TransactionException(
-                            String.format("Existing transaction found for transaction marked with propagation 'never', xid = %s"
-                                    , tx.getXid()));
+                                String.format("Existing transaction found for transaction marked with propagation 'never', xid = %s"
+                                        , tx.getXid()));
                     } else {
                         // Execute without transaction and return.
                         return business.execute();
@@ -108,13 +110,12 @@ public class TransactionalTemplate {
                     throw new TransactionException("Not Supported Propagation:" + propagation);
             }
 
-            // 1.3 If null, create new transaction with role 'GlobalTransactionRole.Launcher'.
-            if (tx == null) {
-                tx = GlobalTransactionContext.createNew();
-            }
-
             // set current tx config to holder
             GlobalLockConfig previousConfig = replaceGlobalLockConfig(txInfo);
+
+            if (tx.getGlobalTransactionRole() == GlobalTransactionRole.Participant) {
+                LOGGER.info("join into a existing global transaction,xid={}", tx.getXid());
+            }
 
             try {
                 // 2. If the tx role is 'GlobalTransactionRole.Launcher', send the request of beginTransaction to TC,
@@ -132,13 +133,13 @@ public class TransactionalTemplate {
                 }
 
                 // 4. everything is fine, commit.
-                commitTransaction(tx);
+                commitTransaction(tx, txInfo);
 
                 return rs;
             } finally {
                 //5. clear
                 resumeGlobalLockConfig(previousConfig);
-                triggerAfterCompletion();
+                triggerAfterCompletion(tx);
                 cleanUp();
             }
         } finally {
@@ -148,6 +149,19 @@ public class TransactionalTemplate {
             }
         }
     }
+
+    /**
+     * Judge whether timeout
+     *
+     * @param beginTime the beginTime
+     * @param txInfo    the transaction info
+     * @return is timeout
+     */
+    private boolean isTimeout(long beginTime, TransactionInfo txInfo) {
+
+        return (System.currentTimeMillis() - beginTime) > txInfo.getTimeOut();
+    }
+
 
     private boolean existingTransaction(GlobalTransaction tx) {
         return tx != null;
@@ -159,8 +173,9 @@ public class TransactionalTemplate {
 
     private GlobalLockConfig replaceGlobalLockConfig(TransactionInfo info) {
         GlobalLockConfig myConfig = new GlobalLockConfig();
-        myConfig.setLockRetryInternal(info.getLockRetryInternal());
+        myConfig.setLockRetryInterval(info.getLockRetryInterval());
         myConfig.setLockRetryTimes(info.getLockRetryTimes());
+        myConfig.setLockStrategyMode(info.getLockStrategyMode());
         return GlobalLockConfigHolder.setAndReturnPrevious(myConfig);
     }
 
@@ -172,51 +187,128 @@ public class TransactionalTemplate {
         }
     }
 
-    private void completeTransactionAfterThrowing(TransactionInfo txInfo, GlobalTransaction tx, Throwable originalException) throws TransactionalExecutor.ExecutionException {
+    private void completeTransactionAfterThrowing(TransactionInfo txInfo, GlobalTransaction tx, Throwable originalException)
+            throws TransactionalExecutor.ExecutionException, TransactionException {
         //roll back
         if (txInfo != null && txInfo.rollbackOn(originalException)) {
-            try {
-                rollbackTransaction(tx, originalException);
-            } catch (TransactionException txe) {
-                // Failed to rollback
-                throw new TransactionalExecutor.ExecutionException(tx, txe,
-                        TransactionalExecutor.Code.RollbackFailure, originalException);
-            }
+            rollbackTransaction(tx, originalException);
         } else {
             // not roll back on this exception, so commit
-            commitTransaction(tx);
+            commitTransaction(tx, txInfo);
         }
     }
 
-    private void commitTransaction(GlobalTransaction tx) throws TransactionalExecutor.ExecutionException {
+    private void commitTransaction(GlobalTransaction tx, TransactionInfo txInfo)
+            throws TransactionalExecutor.ExecutionException, TransactionException {
+        if (tx.getGlobalTransactionRole() != GlobalTransactionRole.Launcher) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Ignore commit: just involved in global transaction [{}]", tx.getXid());
+            }
+            return;
+        }
+        if (isTimeout(tx.getCreateTime(), txInfo)) {
+            // business execution timeout
+            Exception exx = new TmTransactionException(TransactionExceptionCode.TransactionTimeout,
+                String.format("client detected transaction timeout before commit, so change to rollback, xid = %s", tx.getXid()));
+            rollbackTransaction(tx, exx);
+            return;
+        }
+
         try {
             triggerBeforeCommit();
             tx.commit();
-            triggerAfterCommit();
+            GlobalStatus afterCommitStatus = tx.getLocalStatus();
+            TransactionalExecutor.Code code = TransactionalExecutor.Code.Unknown;
+            switch (afterCommitStatus) {
+                case TimeoutRollbacking:
+                    code = TransactionalExecutor.Code.Rollbacking;
+                    break;
+                case TimeoutRollbacked:
+                    code = TransactionalExecutor.Code.RollbackDone;
+                    break;
+                case Finished:
+                    code = TransactionalExecutor.Code.CommitFailure;
+                    break;
+                default:
+            }
+            Exception statusException = null;
+            if (GlobalStatus.isTwoPhaseHeuristic(afterCommitStatus)) {
+                statusException = new TmTransactionException(TransactionExceptionCode.CommitHeuristic,
+                    String.format("Global transaction[%s] not found, may be rollbacked.", tx.getXid()));
+            } else if (GlobalStatus.isOnePhaseTimeout(afterCommitStatus)) {
+                statusException = new TmTransactionException(TransactionExceptionCode.TransactionTimeout,
+                    String.format("Global transaction[%s] is timeout and will be rollback[TC].", tx.getXid()));
+            }
+            if (null != statusException) {
+                throw new TransactionalExecutor.ExecutionException(tx, statusException, code);
+            }
+            triggerAfterCommit(tx);
         } catch (TransactionException txe) {
             // 4.1 Failed to commit
             throw new TransactionalExecutor.ExecutionException(tx, txe,
-                TransactionalExecutor.Code.CommitFailure);
+                    TransactionalExecutor.Code.CommitFailure);
         }
     }
 
     private void rollbackTransaction(GlobalTransaction tx, Throwable originalException) throws TransactionException, TransactionalExecutor.ExecutionException {
-        triggerBeforeRollback();
-        tx.rollback();
-        triggerAfterRollback();
-        // 3.1 Successfully rolled back
-        throw new TransactionalExecutor.ExecutionException(tx, GlobalStatus.RollbackRetrying.equals(tx.getLocalStatus())
-            ? TransactionalExecutor.Code.RollbackRetrying : TransactionalExecutor.Code.RollbackDone, originalException);
+        if (tx.getGlobalTransactionRole() != GlobalTransactionRole.Launcher) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Ignore rollback: just involved in global transaction [{}]", tx.getXid());
+            }
+            return;
+        }
+        try {
+            triggerBeforeRollback();
+            tx.rollback();
+            triggerAfterRollback();
+        } catch (TransactionException txe) {
+            // Failed to rollback
+            throw new TransactionalExecutor.ExecutionException(tx, txe,
+                    TransactionalExecutor.Code.RollbackFailure, originalException);
+        }
+
+        //# fix #5231
+        TransactionalExecutor.Code code;
+        switch (tx.getLocalStatus()) {
+            case RollbackFailed:
+            case TimeoutRollbackFailed:
+            case RollbackRetryTimeout:
+                code = TransactionalExecutor.Code.RollbackFailure;
+                break;
+            case Rollbacking:
+            case RollbackRetrying:
+            case TimeoutRollbacking:
+            case TimeoutRollbackRetrying:
+                code = TransactionalExecutor.Code.Rollbacking;
+                break;
+            case TimeoutRollbacked:
+            case Rollbacked:
+                //rollback transactions but do not exist are usually considered completed
+            case Finished:
+                code = TransactionalExecutor.Code.RollbackDone;
+                break;
+            default:
+                code = TransactionalExecutor.Code.Unknown;
+                LOGGER.warn("{} rollback in the state {}", tx.getXid(), tx.getLocalStatus());
+        }
+        throw new TransactionalExecutor.ExecutionException(tx, code, originalException);
+
     }
 
     private void beginTransaction(TransactionInfo txInfo, GlobalTransaction tx) throws TransactionalExecutor.ExecutionException {
+        if (tx.getGlobalTransactionRole() != GlobalTransactionRole.Launcher) {
+            if (LOGGER.isDebugEnabled()) {
+                LOGGER.debug("Ignore begin: just involved in global transaction [{}]", tx.getXid());
+            }
+            return;
+        }
         try {
             triggerBeforeBegin();
             tx.begin(txInfo.getTimeOut(), txInfo.getName());
             triggerAfterBegin();
         } catch (TransactionException txe) {
             throw new TransactionalExecutor.ExecutionException(tx, txe,
-                TransactionalExecutor.Code.BeginFailure);
+                    TransactionalExecutor.Code.BeginFailure);
 
         }
     }
@@ -271,7 +363,7 @@ public class TransactionalTemplate {
         }
     }
 
-    private void triggerAfterCommit() {
+    private void triggerAfterCommit(GlobalTransaction tx) {
         for (TransactionHook hook : getCurrentHooks()) {
             try {
                 hook.afterCommit();
@@ -281,14 +373,17 @@ public class TransactionalTemplate {
         }
     }
 
-    private void triggerAfterCompletion() {
-        for (TransactionHook hook : getCurrentHooks()) {
-            try {
-                hook.afterCompletion();
-            } catch (Exception e) {
-                LOGGER.error("Failed execute afterCompletion in hook {}", e.getMessage(), e);
+    private void triggerAfterCompletion(GlobalTransaction tx) {
+        if (tx == null || tx.getGlobalTransactionRole() == GlobalTransactionRole.Launcher) {
+            for (TransactionHook hook : getCurrentHooks()) {
+                try {
+                    hook.afterCompletion();
+                } catch (Exception e) {
+                    LOGGER.error("Failed execute afterCompletion in hook {}", e.getMessage(), e);
+                }
             }
         }
+
     }
 
     private void cleanUp() {

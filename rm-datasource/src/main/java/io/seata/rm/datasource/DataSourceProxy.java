@@ -16,15 +16,13 @@
 package io.seata.rm.datasource;
 
 import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.ResultSet;
 import java.sql.SQLException;
-import java.util.concurrent.ScheduledExecutorService;
-import java.util.concurrent.ScheduledThreadPoolExecutor;
-import java.util.concurrent.TimeUnit;
+
 import javax.sql.DataSource;
 
-import io.seata.common.thread.NamedThreadFactory;
-import io.seata.config.ConfigurationFactory;
-import io.seata.core.constants.ConfigurationKeys;
+import io.seata.common.Constants;
 import io.seata.core.context.RootContext;
 import io.seata.core.model.BranchType;
 import io.seata.core.model.Resource;
@@ -32,11 +30,9 @@ import io.seata.rm.DefaultResourceManager;
 import io.seata.rm.datasource.sql.struct.TableMetaCacheFactory;
 import io.seata.rm.datasource.util.JdbcUtils;
 import io.seata.sqlparser.util.JdbcConstants;
+import org.apache.commons.lang.StringUtils;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
-
-import static io.seata.common.DefaultValues.DEFAULT_CLIENT_TABLE_META_CHECK_ENABLE;
-import static io.seata.common.DefaultValues.DEFAULT_TABLE_META_CHECKER_INTERVAL;
 
 /**
  * The type Data source proxy.
@@ -53,24 +49,22 @@ public class DataSourceProxy extends AbstractDataSourceProxy implements Resource
 
     private String jdbcUrl;
 
+    private String resourceId;
+
     private String dbType;
 
     private String userName;
 
-    /**
-     * Enable the table meta checker
-     */
-    private static boolean ENABLE_TABLE_META_CHECKER_ENABLE = ConfigurationFactory.getInstance().getBoolean(
-        ConfigurationKeys.CLIENT_TABLE_META_CHECK_ENABLE, DEFAULT_CLIENT_TABLE_META_CHECK_ENABLE);
+    private String kernelVersion;
+
+    private String productVersion;
 
     /**
-     * Table meta checker interval
+     * POLARDB-X 1.X -> TDDL
+     * POLARDB-X 2.X & MySQL 5.6 -> PXC
+     * POLARDB-X 2.X & MySQL 5.7 -> AliSQL-X
      */
-    private static final long TABLE_META_CHECKER_INTERVAL = ConfigurationFactory.getInstance().getLong(
-            ConfigurationKeys.CLIENT_TABLE_META_CHECKER_INTERVAL, DEFAULT_TABLE_META_CHECKER_INTERVAL);
-
-    private final ScheduledExecutorService tableMetaExcutor = new ScheduledThreadPoolExecutor(1,
-        new NamedThreadFactory("tableMetaChecker", 1, true));
+    private static final String[] POLARDB_X_PRODUCT_KEYWORD = {"TDDL","AliSQL-X","PXC"};
 
     /**
      * Instantiates a new Data source proxy.
@@ -103,23 +97,53 @@ public class DataSourceProxy extends AbstractDataSourceProxy implements Resource
             dbType = JdbcUtils.getDbType(jdbcUrl);
             if (JdbcConstants.ORACLE.equals(dbType)) {
                 userName = connection.getMetaData().getUserName();
+            } else if (JdbcConstants.MYSQL.equals(dbType)) {
+                validMySQLVersion(connection);
+                checkDerivativeProduct();
             }
         } catch (SQLException e) {
             throw new IllegalStateException("can not init dataSource", e);
         }
+        initResourceId();
         DefaultResourceManager.get().registerResource(this);
-        if (ENABLE_TABLE_META_CHECKER_ENABLE) {
-            tableMetaExcutor.scheduleAtFixedRate(() -> {
-                try (Connection connection = dataSource.getConnection()) {
-                    TableMetaCacheFactory.getTableMetaCache(DataSourceProxy.this.getDbType())
-                        .refresh(connection, DataSourceProxy.this.getResourceId());
-                } catch (Exception ignore) {
-                }
-            }, 0, TABLE_META_CHECKER_INTERVAL, TimeUnit.MILLISECONDS);
-        }
-
+        TableMetaCacheFactory.registerTableMeta(this);
         //Set the default branch type to 'AT' in the RootContext.
         RootContext.setDefaultBranchType(this.getBranchType());
+    }
+
+    /**
+     * Define derivative product version for MySQL Kernel
+     *
+     */
+    private void checkDerivativeProduct() {
+        if (!JdbcConstants.MYSQL.equals(dbType)) {
+            return;
+        }
+        // check for polardb-x
+        if (isPolardbXProduct()) {
+            dbType = JdbcConstants.POLARDBX;
+            return;
+        }
+        // check for other products base on mysql kernel
+    }
+
+    private boolean isPolardbXProduct() {
+        if (StringUtils.isBlank(productVersion)) {
+            return false;
+        }
+        for (String keyword : POLARDB_X_PRODUCT_KEYWORD) {
+            if (productVersion.contains(keyword)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * publish tableMeta refresh event
+     */
+    public void tableMetaRefreshEvent() {
+        TableMetaCacheFactory.tableMetaRefreshEvent(this.getResourceId());
     }
 
     /**
@@ -160,24 +184,66 @@ public class DataSourceProxy extends AbstractDataSourceProxy implements Resource
 
     @Override
     public String getResourceId() {
+        if (resourceId == null) {
+            initResourceId();
+        }
+        return resourceId;
+    }
+
+    private void initResourceId() {
         if (JdbcConstants.POSTGRESQL.equals(dbType)) {
-            return getPGResourceId();
+            initPGResourceId();
         } else if (JdbcConstants.ORACLE.equals(dbType) && userName != null) {
-            return getDefaultResourceId() + "/" + userName;
+            initOracleResourceId();
+        } else if (JdbcConstants.MYSQL.equals(dbType) || JdbcConstants.POLARDBX.equals(dbType)) {
+            initMysqlResourceId();
+        } else if (JdbcConstants.DM.equals(dbType)) {
+            initDMResourceId();
         } else {
-            return getDefaultResourceId();
+            initDefaultResourceId();
         }
     }
 
     /**
-     * get the default resource id
-     * @return resource id
+     * init the default resource id
      */
-    private String getDefaultResourceId() {
+    private void initDefaultResourceId() {
         if (jdbcUrl.contains("?")) {
-            return jdbcUrl.substring(0, jdbcUrl.indexOf('?'));
+            resourceId = jdbcUrl.substring(0, jdbcUrl.indexOf('?'));
         } else {
-            return jdbcUrl;
+            resourceId = jdbcUrl;
+        }
+    }
+
+    /**
+     * init the oracle resource id
+     */
+    private void initOracleResourceId() {
+        if (jdbcUrl.contains("?")) {
+            resourceId = jdbcUrl.substring(0, jdbcUrl.indexOf('?')) + "/" + userName;
+        } else {
+            resourceId = jdbcUrl + "/" + userName;
+        }
+    }
+
+    /**
+     * prevent mysql url like
+     * jdbc:mysql:loadbalance://192.168.100.2:3306,192.168.100.1:3306/seata
+     * it will cause the problem like
+     * 1.rm client is not connected
+     */
+    private void initMysqlResourceId() {
+        String startsWith = "jdbc:mysql:loadbalance://";
+        if (jdbcUrl.startsWith(startsWith)) {
+            String url;
+            if (jdbcUrl.contains("?")) {
+                url = jdbcUrl.substring(0, jdbcUrl.indexOf('?'));
+            } else {
+                url = jdbcUrl;
+            }
+            resourceId = url.replace(",", "|");
+        } else {
+            initDefaultResourceId();
         }
     }
 
@@ -189,17 +255,20 @@ public class DataSourceProxy extends AbstractDataSourceProxy implements Resource
      * it will cause the problem like
      * 1.get file lock fail
      * 2.error table meta cache
-     * @return resourceId
      */
-    private String getPGResourceId() {
+    private void initPGResourceId() {
         if (jdbcUrl.contains("?")) {
             StringBuilder jdbcUrlBuilder = new StringBuilder();
-            jdbcUrlBuilder.append(jdbcUrl.substring(0, jdbcUrl.indexOf('?')));
+            jdbcUrlBuilder.append(jdbcUrl, 0, jdbcUrl.indexOf('?'));
+
             StringBuilder paramsBuilder = new StringBuilder();
-            String paramUrl = jdbcUrl.substring(jdbcUrl.indexOf('?') + 1, jdbcUrl.length());
+            String paramUrl = jdbcUrl.substring(jdbcUrl.indexOf('?') + 1);
             String[] urlParams = paramUrl.split("&");
             for (String urlParam : urlParams) {
                 if (urlParam.contains("currentSchema")) {
+                    if (urlParam.contains(Constants.DBKEYS_SPLIT_CHAR)) {
+                        urlParam = urlParam.replace(Constants.DBKEYS_SPLIT_CHAR, "!");
+                    }
                     paramsBuilder.append(urlParam);
                     break;
                 }
@@ -209,14 +278,74 @@ public class DataSourceProxy extends AbstractDataSourceProxy implements Resource
                 jdbcUrlBuilder.append("?");
                 jdbcUrlBuilder.append(paramsBuilder);
             }
-            return jdbcUrlBuilder.toString();
+            resourceId = jdbcUrlBuilder.toString();
         } else {
-            return jdbcUrl;
+            resourceId = jdbcUrl;
+        }
+    }
+
+    private void initDMResourceId() {
+        LOGGER.warn("support for the dameng database is currently an experimental feature ");
+        if (jdbcUrl.contains("?")) {
+            StringBuilder jdbcUrlBuilder = new StringBuilder();
+            jdbcUrlBuilder.append(jdbcUrl, 0, jdbcUrl.indexOf('?'));
+
+            StringBuilder paramsBuilder = new StringBuilder();
+            String paramUrl = jdbcUrl.substring(jdbcUrl.indexOf('?') + 1);
+            String[] urlParams = paramUrl.split("&");
+            for (String urlParam : urlParams) {
+                if (urlParam.contains("schema")) {
+                    // remove the '"'
+                    if (urlParam.contains("\"")) {
+                        urlParam = urlParam.replaceAll("\"", "");
+                    }
+                    paramsBuilder.append(urlParam);
+                    break;
+                }
+            }
+
+            if (paramsBuilder.length() > 0) {
+                jdbcUrlBuilder.append("?");
+                jdbcUrlBuilder.append(paramsBuilder);
+            }
+            resourceId = jdbcUrlBuilder.toString();
+        } else {
+            resourceId = jdbcUrl;
         }
     }
 
     @Override
     public BranchType getBranchType() {
         return BranchType.AT;
+    }
+
+    public String getKernelVersion() {
+        return kernelVersion;
+    }
+
+    private void validMySQLVersion(Connection connection) {
+        if (!JdbcConstants.MYSQL.equals(dbType)) {
+            return;
+        }
+        try (PreparedStatement preparedStatement = connection.prepareStatement("SELECT VERSION()");
+             ResultSet versionResult = preparedStatement.executeQuery()) {
+            if (versionResult.next()) {
+                String version = versionResult.getString("VERSION()");
+                if (StringUtils.isBlank(version)) {
+                    return;
+                }
+                int dashIdx = version.indexOf('-');
+                // in mysql: 5.6.45, in polardb-x: 5.6.45-TDDL-xxx
+                if (dashIdx > 0) {
+                    kernelVersion = version.substring(0, dashIdx);
+                    productVersion = version.substring(dashIdx + 1);
+                } else {
+                    kernelVersion = version;
+                    productVersion = version;
+                }
+            }
+        } catch (Exception e) {
+            LOGGER.error("check mysql version fail error: {}", e.getMessage());
+        }
     }
 }

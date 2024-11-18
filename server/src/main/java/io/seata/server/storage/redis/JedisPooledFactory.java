@@ -19,21 +19,24 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.Set;
 
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-
-import io.seata.common.util.ConfigTools;
 import io.seata.common.exception.RedisException;
+import io.seata.common.util.ConfigTools;
 import io.seata.common.util.StringUtils;
 import io.seata.config.Configuration;
 import io.seata.config.ConfigurationFactory;
 import io.seata.core.constants.ConfigurationKeys;
-
-import redis.clients.jedis.Jedis;
+import org.slf4j.Logger;
+import org.slf4j.LoggerFactory;
 import redis.clients.jedis.JedisPool;
 import redis.clients.jedis.JedisPoolAbstract;
 import redis.clients.jedis.JedisPoolConfig;
 import redis.clients.jedis.JedisSentinelPool;
+import redis.clients.jedis.Protocol;
+import redis.clients.jedis.Jedis;
+
+import static io.seata.common.DefaultValues.DEFAULT_REDIS_MAX_IDLE;
+import static io.seata.common.DefaultValues.DEFAULT_REDIS_MAX_TOTAL;
+import static io.seata.common.DefaultValues.DEFAULT_REDIS_MIN_IDLE;
 
 /**
  * @author funkye
@@ -49,13 +52,6 @@ public class JedisPooledFactory {
     private static final String HOST = "127.0.0.1";
 
     private static final int PORT = 6379;
-
-    private static final int MINCONN = 1;
-
-    private static final int MAXCONN = 10;
-
-    private static final int MAXTOTAL = 100;
-
     private static final int DATABASE = 0;
 
     private static final int SENTINEL_HOST_NUMBER = 3;
@@ -64,15 +60,16 @@ public class JedisPooledFactory {
 
     /**
      * get the RedisPool instance (singleton)
-     * 
+     *
      * @return redisPool
      */
     public static JedisPoolAbstract getJedisPoolInstance(JedisPoolAbstract... jedisPools) {
         if (jedisPool == null) {
             synchronized (JedisPooledFactory.class) {
                 if (jedisPool == null) {
+                    JedisPoolAbstract tempJedisPool = null;
                     if (jedisPools != null && jedisPools.length > 0) {
-                        jedisPool = jedisPools[0];
+                        tempJedisPool = jedisPools[0];
                     } else {
                         String password = CONFIGURATION.getConfig(ConfigurationKeys.STORE_REDIS_PASSWORD);
                         if (StringUtils.isBlank(password)) {
@@ -83,16 +80,16 @@ public class JedisPooledFactory {
                                 try {
                                     password = ConfigTools.publicDecrypt(password, publicKey);
                                 } catch (Exception e) {
-                                    LOGGER.error(
-                                        "decryption failed,please confirm whether the ciphertext and secret key are correct! error msg: {}",
-                                        e.getMessage());
+                                    LOGGER.error("decryption failed,please confirm whether the ciphertext and secret key are correct! error msg: {}", e.getMessage());
                                 }
                             }
                         }
                         JedisPoolConfig poolConfig = new JedisPoolConfig();
-                        poolConfig.setMinIdle(CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_MIN_CONN, MINCONN));
-                        poolConfig.setMaxIdle(CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_MAX_CONN, MAXCONN));
-                        poolConfig.setMaxTotal(CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_MAX_TOTAL, MAXTOTAL));
+                        poolConfig.setMinIdle(CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_MIN_CONN,
+                            DEFAULT_REDIS_MIN_IDLE));
+                        poolConfig.setMaxIdle(CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_MAX_CONN,
+                            DEFAULT_REDIS_MAX_IDLE));
+                        poolConfig.setMaxTotal(CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_MAX_TOTAL, DEFAULT_REDIS_MAX_TOTAL));
                         String mode = CONFIGURATION.getConfig(ConfigurationKeys.STORE_REDIS_MODE,ConfigurationKeys.REDIS_SINGLE_MODE);
                         if (mode.equals(ConfigurationKeys.REDIS_SENTINEL_MODE)) {
                             String masterName = CONFIGURATION.getConfig(ConfigurationKeys.STORE_REDIS_SENTINEL_MASTERNAME);
@@ -102,16 +99,18 @@ public class JedisPooledFactory {
                             Set<String> sentinels = new HashSet<>(SENTINEL_HOST_NUMBER);
                             String[] sentinelHosts = CONFIGURATION.getConfig(ConfigurationKeys.STORE_REDIS_SENTINEL_HOST).split(",");
                             Arrays.asList(sentinelHosts).forEach(sentinelHost -> sentinels.add(sentinelHost));
-                            jedisPool = new JedisSentinelPool(masterName, sentinels, poolConfig, 60000, password,
-                                    CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_DATABASE, DATABASE));
+                            String sentinelPassword = CONFIGURATION.getConfig(ConfigurationKeys.STORE_REDIS_SENTINEL_PASSWORD);
+                            if (StringUtils.isBlank(sentinelPassword)) {
+                                sentinelPassword = null;
+                            }
+                            tempJedisPool = new JedisSentinelPool(masterName, sentinels, poolConfig, 60000, 60000, password, CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_DATABASE, DATABASE),
+                                    null, Protocol.DEFAULT_TIMEOUT, Protocol.DEFAULT_TIMEOUT, sentinelPassword, null);
                         } else if (mode.equals(ConfigurationKeys.REDIS_SINGLE_MODE)) {
                             String host = CONFIGURATION.getConfig(ConfigurationKeys.STORE_REDIS_SINGLE_HOST);
                             host = StringUtils.isBlank(host) ? CONFIGURATION.getConfig(ConfigurationKeys.STORE_REDIS_HOST, HOST) : host;
                             int port = CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_SINGLE_PORT);
                             port = port == 0 ? CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_PORT, PORT) : port;
-                            jedisPool =
-                                    new JedisPool(poolConfig, host, port, 60000, password,
-                                            CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_DATABASE, DATABASE));
+                            tempJedisPool = new JedisPool(poolConfig, host, port, 60000, password, CONFIGURATION.getInt(ConfigurationKeys.STORE_REDIS_DATABASE, DATABASE));
                         } else {
                             throw new RedisException("Configuration error of redis cluster mode");
                         }
@@ -119,6 +118,7 @@ public class JedisPooledFactory {
                     if (LOGGER.isInfoEnabled()) {
                         LOGGER.info("initialization of the build redis connection pool is complete");
                     }
+                    jedisPool = tempJedisPool;
                 }
             }
         }
@@ -127,7 +127,7 @@ public class JedisPooledFactory {
 
     /**
      * get an instance of Jedis (connection) from the connection pool
-     * 
+     *
      * @return jedis
      */
     public static Jedis getJedisInstance() {

@@ -20,15 +20,26 @@ import java.util.List;
 
 /**
  * The default expr able.
+ *
  * @author jsbxyyx
  */
 public interface Defaultable {
 
     /**
      * get primary key values by default keyword.
-     * @return
-     * @throws SQLException
+     *
+     * @return pk values by default
+     * @throws SQLException the sql exception
      */
     List<Object> getPkValuesByDefault() throws SQLException;
+
+    /**
+     * get primary key values by default keyword.
+     *
+     * @param pkKey the pk key
+     * @return pk values by default
+     * @throws SQLException the sql exception
+     */
+    List<Object> getPkValuesByDefault(String pkKey) throws SQLException;
 
 }

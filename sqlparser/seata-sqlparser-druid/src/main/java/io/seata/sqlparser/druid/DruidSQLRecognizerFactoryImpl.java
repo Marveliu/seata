@@ -37,7 +37,7 @@ import java.util.List;
 class DruidSQLRecognizerFactoryImpl implements SQLRecognizerFactory {
     @Override
     public List<SQLRecognizer> create(String sql, String dbType) {
-        List<SQLStatement> asts = SQLUtils.parseStatements(sql, dbType);
+        List<SQLStatement> asts = SQLUtils.parseStatements(sql, DruidDbTypeAdapter.getAdaptiveDbType(dbType));
         if (CollectionUtils.isEmpty(asts)) {
             throw new UnsupportedOperationException("Unsupported SQL: " + sql);
         }
@@ -59,7 +59,7 @@ class DruidSQLRecognizerFactoryImpl implements SQLRecognizerFactory {
             } else if (ast instanceof SQLSelectStatement) {
                 recognizer = recognizerHolder.getSelectForUpdateRecognizer(sql, ast);
             }
-            if (recognizer != null) {
+            if (recognizer != null && recognizer.isSqlSyntaxSupports()) {
                 if (recognizers == null) {
                     recognizers = new ArrayList<>();
                 }
